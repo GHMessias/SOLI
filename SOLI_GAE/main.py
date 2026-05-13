@@ -2,12 +2,15 @@ import numpy as np
 import scipy.sparse as sp
 import torch
 import torch.nn as nn
+import argparse
 from sklearn.linear_model import LogisticRegression
 from sklearn.decomposition import IncrementalPCA
 import numpy as np
 import matplotlib.pyplot as plt
+import os
 import os.path as osp
 import sys
+import datetime
 from random import random
 from nltk.cluster import em
 import torch.nn as nn
@@ -22,13 +25,29 @@ import numpy as np
 import scipy.sparse as sp
 import torch
 from sklearn.metrics import roc_auc_score, average_precision_score
-from utils import mask_test_edges,get_roc_score,acc_score
-dataset = 'cora'
+from utils import acc_score
+
+parser = argparse.ArgumentParser(description="SOLI_GAE")
+parser.add_argument('--device', type=str, default='cpu', choices=['cpu', 'cuda'])
+parser.add_argument('--data_pt', type=str, default=None, help='Optional PyG data.pt path with x, y and edge_index')
+parser.add_argument('--dataset', type=str, default='cora')
+parser.add_argument('--output_dir', type=str, default='outputs')
+parser.add_argument('--epochs', type=int, default=100)
+parser.add_argument('--kmeans_clusters', type=int, default=None)
+args = parser.parse_args()
+if args.device == 'cuda' and not torch.cuda.is_available():
+    raise RuntimeError("CUDA was requested with --device cuda, but it is not available.")
+if args.device == 'cpu':
+    os.environ["CUDA_VISIBLE_DEVICES"] = ""
+device = torch.device(args.device)
+os.makedirs(args.output_dir, exist_ok=True)
+
+dataset = args.dataset
 
 
 # training params
 batch_size = 1
-nb_epochs = 100
+nb_epochs = args.epochs
 
 
 patience = 20
@@ -40,7 +59,10 @@ drop_prob = 0.0
 sparse = True
 nonlinearity = 'prelu' # special name to separate parameters
 
-adj, feature, labels, idx_train, idx_val, idx_test = process.load_data(dataset)
+if args.data_pt:
+    adj, feature, labels, idx_train, idx_val, idx_test = process.load_data_pt(args.data_pt)
+else:
+    adj, feature, labels, idx_train, idx_val, idx_test = process.load_data(dataset)
 X=feature.todense()
 Y=labels
 import networkx as nx
@@ -48,7 +70,7 @@ Inputs=deepcopy(X)
 Input=deepcopy(Inputs)
 dataMain=deepcopy(Input.astype(int))
 dataMain=np.array(dataMain)
-graphMain=nx.from_numpy_matrix(adj.todense())
+graphMain=nx.from_numpy_array(adj.todense())
 listClique=list(nx.find_cliques(graphMain))
 
 for i in listClique:
@@ -62,7 +84,7 @@ features=Input
 
 nb_nodes = features.shape[0]
 ft_size = features.shape[1]
-n_clusters = labels.shape[1]
+n_clusters = args.kmeans_clusters if args.kmeans_clusters is not None else labels.shape[1]
 
 adj = process.normalize_adj(adj + sp.eye(adj.shape[0]))
 
@@ -79,15 +101,14 @@ labels = torch.FloatTensor(labels[np.newaxis])
 model = InfoPartitioned(ft_size, 700, nonlinearity)
 optimiser = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=l2_coef)
 
-if torch.cuda.is_available():
-    print('Using CUDA')
-    model.cuda()
-    features = features.cuda()
-    if sparse:
-        sp_adj = sp_adj.cuda()
-    else:
-        adj = adj.cuda()
-    labels = labels.cuda()
+print('Using device: {}'.format(device))
+model = model.to(device)
+features = features.to(device)
+if sparse:
+    sp_adj = sp_adj.to(device)
+else:
+    adj = adj.to(device)
+labels = labels.to(device)
 
 
 b_xent = nn.BCEWithLogitsLoss()
@@ -95,6 +116,7 @@ xent = nn.CrossEntropyLoss()
 cnt_wait = 0
 best = 1e9
 best_t = 0
+best_path = os.path.join(args.output_dir, "SOLI_{}_best.pkl".format(dataset))
 
 for epoch in range(nb_epochs):
     model.train()
@@ -111,11 +133,7 @@ for epoch in range(nb_epochs):
     
     lbl_1 = torch.ones(batch_size, nb_nodes)
     lbl_2 = torch.zeros(batch_size, nb_nodes)
-    lbl = torch.cat((lbl_1, lbl_2), 1)
-
-    if torch.cuda.is_available():
-        shuf_fts = shuf_fts.cuda()
-        lbl = lbl.cuda()
+    lbl = torch.cat((lbl_1, lbl_2), 1).to(device)
     
     
 
@@ -126,7 +144,7 @@ for epoch in range(nb_epochs):
         best = loss
         best_t = epoch
         cnt_wait = 0
-        torch.save(model.state_dict(), 'best.pkl')
+        torch.save(model.state_dict(), best_path)
     else:
         cnt_wait += 1
 
@@ -136,28 +154,14 @@ for epoch in range(nb_epochs):
 
     loss.backward()
     optimiser.step()
-model.load_state_dict(torch.load('best.pkl'))
+model.load_state_dict(torch.load(best_path, map_location=device))
 
 
 embeds, _ = model.embed(features, sp_adj if sparse else adj, sparse, None)
-train_embs = embeds[0, idx_train]
-val_embs = embeds[0, idx_val]
-test_embs = embeds[0, idx_test]
-
-train_lbls = torch.argmax(labels[0, idx_train], dim=1)
-val_lbls = torch.argmax(labels[0, idx_val], dim=1)
-test_lbls = torch.argmax(labels[0, idx_test], dim=1)
 emd_lbls = torch.argmax(labels[0,:], dim=1)
 
 embeds=torch.reshape(embeds,[embeds.shape[1],embeds.shape[2]])
 from autoencoders import autoencoder,ClusteringLayer
-
-# Store original adjacency matrix (without diagonal entries) for later
-adj_orig = adj
-adj_orig = adj_orig - sp.dia_matrix((adj_orig.diagonal()[np.newaxis, :], [0]), shape=adj_orig.shape)
-adj_orig.eliminate_zeros()
-adj_train, train_edges, val_edges, val_edges_false, test_edges, test_edges_false = mask_test_edges(adj)
-adj = adj_train
 
 x = embeds.cpu().detach().numpy()
 y = emd_lbls.cpu().detach().numpy()
@@ -169,14 +173,13 @@ from tqdm import tqdm
 from time import time
 import numpy as np
 import keras.backend as K
-from keras.engine.topology import Layer, InputSpec
-from keras.layers import Dense, Input
+from keras.layers import Dense, Input, InputSpec, Layer
 from keras.models import Model
 from keras.optimizers import SGD
 from keras import callbacks
 from keras.initializers import VarianceScaling
 from sklearn.cluster import KMeans
-kmeans = KMeans(n_clusters=n_clusters, n_init=20, n_jobs=4)
+kmeans = KMeans(n_clusters=n_clusters, n_init=20)
 y_pred_kmeans = kmeans.fit_predict(x)
 print("Kmeans NMI",normalized_mutual_info_score(emd_lbls.cpu().detach().numpy(),y_pred_kmeans))
 print("Kmeans ACC",acc_score(emd_lbls.cpu().detach().numpy(),y_pred_kmeans))
@@ -185,19 +188,21 @@ dims = [x.shape[-1], 700,32]
 
 init = VarianceScaling(scale=1., mode='fan_in',
                            distribution='uniform')
-pretrain_optimizer = SGD(lr=1, momentum=0.9)
+pretrain_optimizer = SGD(learning_rate=1.0, momentum=0.9)
 pretrain_epochs = 300
 batch_size = 64
-save_dir = './results'
+save_dir = os.path.join(args.output_dir, "soli_results")
+os.makedirs(save_dir, exist_ok=True)
 autoencoder, encoder = autoencoder(dims, init=init)
 autoencoder.compile(optimizer=pretrain_optimizer, loss='mse')
 autoencoder.fit(x, x, batch_size=batch_size, epochs=pretrain_epochs) #, callbacks=cb)
-autoencoder.save_weights(save_dir + '/ae_weights2.h5')
-autoencoder.load_weights(save_dir + '/ae_weights2.h5')
+autoencoder_weights_path = os.path.join(save_dir, 'ae_weights2.weights.h5')
+autoencoder.save_weights(autoencoder_weights_path)
+autoencoder.load_weights(autoencoder_weights_path)
 
 clustering_layer = ClusteringLayer(n_clusters, name='clustering')(encoder.output)
 model1 = Model(inputs=encoder.input, outputs=clustering_layer)
-model1.compile(optimizer=SGD(0.01, 0.9), loss='kld')
+model1.compile(optimizer=SGD(learning_rate=0.01, momentum=0.9), loss='kld')
 
 
 kmeans = KMeans(n_clusters=n_clusters, n_init=20)
@@ -240,8 +245,9 @@ for ite in range(int(maxiter)):
     loss = model1.train_on_batch(x=x[idx], y=p[idx])
     index = index + 1 if (index + 1) * batch_size <= x.shape[0] else 0
 
-model1.save_weights(save_dir + '/Soli.h5')
-model1.load_weights(save_dir + '/Soli.h5')
+soli_weights_path = os.path.join(save_dir, 'Soli.weights.h5')
+model1.save_weights(soli_weights_path)
+model1.load_weights(soli_weights_path)
 
 q = model1.predict(x, verbose=0)
 p = target_distribution(q)  # update the auxiliary target distribution p
@@ -254,25 +260,11 @@ if y is not None:
     ari = np.round(adjusted_rand_score(y, y_pred), 5)
     loss = np.round(loss, 5)
     print('Acc = %.5f, nmi = %.5f, ari = %.5f' % (acc, nmi, ari), ' ; loss=', loss)
+
+timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M")
+labels_path = os.path.join(args.output_dir, "SOLI_{}_labels.npy".format(timestamp))
+np.save(labels_path, y_pred.astype(np.int64))
+print("SOLI labels saved in: {}".format(labels_path))
     
-import seaborn as sns
-import sklearn.metrics
-import matplotlib.pyplot as plt
-sns.set(font_scale=3)
-confusion_matrix = sklearn.metrics.confusion_matrix(y, y_pred)
-
-# plt.figure(figsize=(16, 14))
-# sns.heatmap(confusion_matrix, annot=True, fmt="d", annot_kws={"size": 20});
-# plt.title("Confusion matrix", fontsize=30)
-# plt.ylabel('True label', fontsize=25)
-# plt.xlabel('Clustering label', fontsize=25)
-# plt.show()
-
-
-roc_score, ap_score = get_roc_score(x, adj_orig, test_edges, test_edges_false)
-tqdm.write('Test ROC score: ' + str(roc_score))
-tqdm.write('Test AP score: ' + str(ap_score))
-
 #Cora---ACC=0.765140, f1_macro=0.718944, precision_macro=0.804534, recall_macro=0.722651, f1_micro=0.765140, precision_micro=0.765140, recall_micro=0.765140, NMI=0.601065, ADJ_RAND_SCORE=0.566581
 #Citeseer---ACC=0.671175, f1_macro=0.619219, precision_macro=0.640110, recall_macro=0.621541, f1_micro=0.671175, precision_micro=0.671175, recall_micro=0.671175, NMI=0.420832, ADJ_RAND_SCORE=0.399086
-

@@ -2,10 +2,84 @@ import numpy as np
 import pickle as pkl
 import networkx as nx
 import scipy.sparse as sp
-from scipy.sparse.linalg.eigen.arpack import eigsh
+from scipy.sparse.linalg import eigsh
 import sys
 import torch
 import torch.nn as nn
+
+def torch_load(path):
+    try:
+        return torch.load(path, map_location='cpu', weights_only=False)
+    except TypeError:
+        return torch.load(path, map_location='cpu')
+
+def as_numpy(value):
+    if hasattr(value, 'is_sparse') and value.is_sparse:
+        value = value.to_dense()
+    if hasattr(value, 'detach'):
+        value = value.detach().cpu().numpy()
+    return np.asarray(value)
+
+def get_data_attr(data, name):
+    if isinstance(data, dict):
+        return data.get(name)
+    return getattr(data, name, None)
+
+def unwrap_data_pt(obj):
+    if isinstance(obj, (list, tuple)):
+        for item in obj:
+            if get_data_attr(item, 'x') is not None and get_data_attr(item, 'edge_index') is not None:
+                return item
+    return obj
+
+def labels_to_one_hot(labels):
+    labels = np.asarray(labels)
+    if labels.ndim == 2 and labels.shape[1] > 1:
+        return labels.astype(np.float32)
+    labels = labels.reshape(-1).astype(int)
+    classes = np.unique(labels)
+    class_to_index = {label: i for i, label in enumerate(classes)}
+    one_hot = np.zeros((labels.shape[0], len(classes)), dtype=np.float32)
+    for i, label in enumerate(labels):
+        one_hot[i, class_to_index[label]] = 1.0
+    return one_hot
+
+def split_indices(num_nodes, train_frac=0.6, val_frac=0.2, seed=0):
+    rng = np.random.RandomState(seed)
+    indices = rng.permutation(num_nodes)
+    train_end = int(num_nodes * train_frac)
+    val_end = train_end + int(num_nodes * val_frac)
+    idx_train = indices[:train_end]
+    idx_val = indices[train_end:val_end]
+    idx_test = indices[val_end:]
+    return idx_train, idx_val, idx_test
+
+def load_data_pt(path, seed=0):
+    data = unwrap_data_pt(torch_load(path))
+    x = get_data_attr(data, 'x')
+    y = get_data_attr(data, 'y')
+    edge_index = get_data_attr(data, 'edge_index')
+
+    if x is None or y is None or edge_index is None:
+        raise ValueError("Expected data.pt with x, y and edge_index attributes.")
+
+    features = sp.csr_matrix(as_numpy(x).astype(np.float32))
+    labels = labels_to_one_hot(as_numpy(y))
+    edge_index = as_numpy(edge_index).astype(np.int64)
+    if edge_index.shape[0] != 2:
+        edge_index = edge_index.T
+    if edge_index.shape[0] != 2:
+        raise ValueError("edge_index must have shape [2, num_edges].")
+
+    num_nodes = features.shape[0]
+    adj = sp.coo_matrix(
+        (np.ones(edge_index.shape[1]), (edge_index[0], edge_index[1])),
+        shape=(num_nodes, num_nodes),
+        dtype=np.float32,
+    )
+    adj = adj + adj.T.multiply(adj.T > adj) - adj.multiply(adj.T > adj)
+    idx_train, idx_val, idx_test = split_indices(num_nodes, seed=seed)
+    return adj, features, labels, idx_train, idx_val, idx_test
 
 def parse_skipgram(fname):
     with open(fname) as f:
